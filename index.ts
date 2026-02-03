@@ -1,0 +1,459 @@
+import React, { useState, useMemo, useRef, useEffect } from 'react';
+import {
+    Calculator, X, Cloud, Loader2, User,
+    ShieldCheck, ArrowDownCircle, ArrowUpCircle,
+    CameraIcon, Archive, ChevronRight, Fingerprint,
+    Home, History, LogOut, Calendar, Clock, Camera, Sparkles, AlertCircle, Edit3, DollarSign
+} from 'lucide-react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged, User as FirebaseUser } from 'firebase/auth';
+import { getFirestore, doc, setDoc, getDoc, onSnapshot, collection, query, Timestamp } from 'firebase/firestore';
+
+// --- CONFIGURACIÓN DE FIREBASE ---
+const firebaseConfig = JSON.parse(__firebase_config);
+const firebaseApp = initializeApp(firebaseConfig);
+const auth = getAuth(firebaseApp);
+const db = getFirestore(firebaseApp);
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'app_web_delicia_helado';
+
+// --- INTERFACES ---
+interface AttendanceRecord { photo: string; time: string; timestamp: number; }
+interface DayAttendance { entry?: AttendanceRecord; exit?: AttendanceRecord; }
+interface Employee {
+    id: string; name: string; password?: string; hourlyRate: number; stimulus: number;
+    foodBonus: number; weeklyTime: Record<string, { h: number; m: number }>;
+    restDays: Record<string, boolean>; attendance: Record<string, DayAttendance>;
+    manualRestPay: number | null;
+}
+
+const DAYS_LIST = ['Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado', 'Domingo'];
+
+// --- UTILIDAD DE CÁLCULO DE TIEMPO ---
+const parseTimeToMinutes = (timeStr: string): number | null => {
+    if (!timeStr) return null;
+    let clean = timeStr.toLowerCase().replace(/\./g, '').trim();
+    const isPM = clean.includes('pm');
+    const isAM = clean.includes('am');
+    let numbersOnly = clean.replace(/[apm\s]/g, '');
+    let hours = 0;
+    let minutes = 0;
+
+    if (numbersOnly.includes(':')) {
+        const parts = numbersOnly.split(':');
+        hours = parseInt(parts[0]) || 0;
+        minutes = parseInt(parts[1]) || 0;
+    } else if (numbersOnly.length <= 2) {
+        hours = parseInt(numbersOnly) || 0;
+        minutes = 0;
+    } else if (numbersOnly.length === 3) {
+        hours = parseInt(numbersOnly.substring(0, 1));
+        minutes = parseInt(numbersOnly.substring(1));
+    } else if (numbersOnly.length === 4) {
+        hours = parseInt(numbersOnly.substring(0, 2));
+        minutes = parseInt(numbersOnly.substring(2));
+    }
+
+    if (isPM && hours < 12) hours += 12;
+    if (isAM && hours === 12) hours = 0;
+    if (hours > 23 || minutes > 59) return null;
+
+    return (hours * 60) + minutes;
+};
+
+export default function App() {
+    // --- ESTADOS ---
+    const [user, setUser] = useState<FirebaseUser | null>(null);
+    const [isAppReady, setIsAppReady] = useState(false);
+    const [isUnlocked, setIsUnlocked] = useState(false);
+    const [view, setView] = useState<'login' | 'app' | 'admin'>('login');
+    const [activeTab, setActiveTab] = useState<'home' | 'settings'>('home');
+    const [currentEmployee, setCurrentEmployee] = useState<Employee | null>(null);
+    const [allEmployees, setAllEmployees] = useState<Employee[]>([]);
+    const [syncing, setSyncing] = useState(false);
+    const [aiMessage, setAiMessage] = useState("");
+    const [unlockPass, setUnlockPass] = useState('');
+    const [loginRole, setLoginRole] = useState<'employee' | 'boss'>('employee');
+    const [loginName, setLoginName] = useState('');
+    const [loginPass, setLoginPass] = useState('');
+    const [authError, setAuthError] = useState('');
+    const [actionLoading, setActionLoading] = useState(false);
+    const [cameraActive, setCameraActive] = useState(false);
+    const [camType, setCamType] = useState<'entry' | 'exit' | null>(null);
+    const videoRef = useRef<HTMLVideoElement>(null);
+    const canvasRef = useRef<HTMLCanvasElement>(null);
+
+    // --- PERSISTENCIA ---
+    useEffect(() => {
+        const initAuth = async () => {
+            try {
+                if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                    await signInWithCustomToken(auth, __initial_auth_token);
+                } else {
+                    await signInAnonymously(auth);
+                }
+            } catch (err) { console.error("Auth error", err); }
+        };
+        initAuth();
+        const unsubscribe = onAuthStateChanged(auth, (u) => {
+            setUser(u);
+            setIsAppReady(true);
+        });
+        return () => unsubscribe();
+    }, []);
+
+    useEffect(() => {
+        if (!user || !currentEmployee?.id) return;
+        const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'employees', currentEmployee.id);
+        return onSnapshot(docRef, (snap) => {
+            if (snap.exists()) setCurrentEmployee({ id: snap.id, ...snap.data() } as Employee);
+        });
+    }, [user, currentEmployee?.id]);
+
+    useEffect(() => {
+        if (!user || view !== 'admin') return;
+        const q = collection(db, 'artifacts', appId, 'public', 'data', 'employees');
+        return onSnapshot(q, (snap) => {
+            const emps: Employee[] = [];
+            snap.forEach(d => emps.push({ id: d.id, ...d.data() } as Employee));
+            setAllEmployees(emps);
+        });
+    }, [user, view]);
+
+    // --- CÁLCULOS DE NÓMINA ---
+    const payroll = useMemo(() => {
+        if (!currentEmployee) return null;
+        let hrs = 0, bonus = 0, days = 0;
+        DAYS_LIST.forEach(d => {
+            if (!currentEmployee.restDays?.[d]) {
+                const t = currentEmployee.weeklyTime?.[d] || { h: 0, m: 0 };
+                const dec = t.h + (t.m / 60);
+                if (dec > 0) {
+                    days++;
+                    hrs += dec;
+                    if (Math.abs(dec - 9) < 0.01) bonus += currentEmployee.foodBonus;
+                }
+            }
+        });
+        const base = hrs * currentEmployee.hourlyRate;
+        const avg = days > 0 ? hrs / days : 0;
+        const rest = currentEmployee.manualRestPay ?? (avg * currentEmployee.hourlyRate);
+        return { total: base + bonus + rest + currentEmployee.stimulus, hrs, bonus, rest, days };
+    }, [currentEmployee]);
+
+    // --- ACCIONES ---
+    const updateDatabase = async (updates: Partial<Employee>) => {
+        if (!currentEmployee?.id || !user) return;
+        setSyncing(true);
+        try {
+            const empRef = doc(db, 'artifacts', appId, 'public', 'data', 'employees', currentEmployee.id);
+            await setDoc(empRef, updates, { merge: true });
+        } catch (e) { console.error("Update error:", e); }
+        finally { setSyncing(false); }
+    };
+
+    const handleExactTimeEdit = (day: string, type: 'entry' | 'exit', val: string) => {
+        const updatedAtt = { ...(currentEmployee?.attendance || {}) };
+        if (!updatedAtt[day]) updatedAtt[day] = {};
+
+        if (!updatedAtt[day][type]) {
+            updatedAtt[day][type] = { photo: '', time: val, timestamp: Date.now() };
+        } else {
+            updatedAtt[day][type]!.time = val;
+        }
+
+        const entryMin = parseTimeToMinutes(type === 'entry' ? val : updatedAtt[day].entry?.time || '');
+        const exitMin = parseTimeToMinutes(type === 'exit' ? val : updatedAtt[day].exit?.time || '');
+
+        const updates: Partial<Employee> = { attendance: updatedAtt };
+
+        if (entryMin !== null && exitMin !== null) {
+            let diff = exitMin - entryMin;
+            if (diff < 0) diff += 1440;
+
+            const updatedWeekly = { ...(currentEmployee?.weeklyTime || {}) };
+            updatedWeekly[day] = { h: Math.floor(diff / 60), m: diff % 60 };
+            updates.weeklyTime = updatedWeekly;
+        }
+        updateDatabase(updates);
+    };
+
+    const handleLogin = async () => {
+        if (!user) return;
+        setAuthError(""); setActionLoading(true);
+        if (loginRole === 'boss') {
+            if (loginPass === "jefe123") setView('admin');
+            else setAuthError("Clave incorrecta");
+            setActionLoading(false); return;
+        }
+        if (!loginName.trim()) { setAuthError("Ingresa tu nombre"); setActionLoading(false); return; }
+        const employeeId = loginName.trim().toLowerCase().replace(/\s/g, '_');
+        const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'employees', employeeId);
+        try {
+            const snap = await getDoc(docRef);
+            if (snap.exists()) {
+                if (snap.data().password === loginPass) { setCurrentEmployee({ id: snap.id, ...snap.data() } as Employee); setView('app'); }
+                else setAuthError("Contraseña incorrecta");
+            } else {
+                const newEmp = { name: loginName, password: loginPass, hourlyRate: 100, stimulus: 250, foodBonus: 50, weeklyTime: {}, restDays: {}, attendance: {}, manualRestPay: null };
+                await setDoc(docRef, newEmp);
+                setCurrentEmployee({ id: employeeId, ...newEmp } as Employee); setView('app');
+            }
+        } catch (e) { setAuthError("Error de red"); }
+        finally { setActionLoading(false); }
+    };
+
+    const openCamera = (type: 'entry' | 'exit') => {
+        // EL JEFE NO PUEDE TOMAR FOTOS
+        if (loginRole === 'boss') {
+            setAiMessage("El administrador solo puede editar horarios.");
+            setTimeout(() => setAiMessage(""), 3000);
+            return;
+        }
+        setCamType(type); setCameraActive(true);
+        setTimeout(async () => {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "user" } });
+                if (videoRef.current) videoRef.current.srcObject = stream;
+            } catch { alert("Activa la cámara"); setCameraActive(false); }
+        }, 300);
+    };
+
+    const captureAndStamp = async () => {
+        if (videoRef.current && canvasRef.current && currentEmployee && user) {
+            const canvas = canvasRef.current; const video = videoRef.current; const ctx = canvas.getContext('2d');
+            if (!ctx) return;
+            canvas.width = video.videoWidth; canvas.height = video.videoHeight;
+            ctx.drawImage(video, 0, 0);
+            const now = new Date();
+            const timeStr = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+            const dayName = DAYS_LIST[(now.getDay() + 6) % 7];
+
+            ctx.font = 'bold 30px sans-serif'; ctx.shadowBlur = 4; ctx.shadowColor = 'black'; ctx.fillStyle = 'white';
+            const label = camType === 'entry' ? 'IN' : 'OUT';
+            const stamp = `${label}: ${dayName} - ${timeStr}`;
+            ctx.fillText(stamp, canvas.width - ctx.measureText(stamp).width - 20, canvas.height - 20);
+
+            const photo = canvas.toDataURL('image/jpeg', 0.8);
+            handleExactTimeEdit(dayName, camType!, timeStr);
+
+            const updatedAtt = { ...(currentEmployee?.attendance || {}) };
+            updatedAtt[dayName] = { ...updatedAtt[dayName], [camType!]: { ...updatedAtt[dayName][camType!], photo, timestamp: now.getTime() } };
+            updateDatabase({ attendance: updatedAtt });
+
+            if (video.srcObject) (video.srcObject as MediaStream).getTracks().forEach(t => t.stop());
+            setCameraActive(false); setAiMessage("¡Foto guardada!"); setTimeout(() => setAiMessage(""), 3000);
+        }
+    };
+
+    // --- RENDERS ---
+    if (!isAppReady) return null;
+
+    if (!isUnlocked) {
+        return (
+            <div className= "min-h-screen bg-slate-950 flex flex-col items-center justify-center p-8 text-center font-sans text-white" >
+            <Fingerprint className="text-indigo-500 w-20 h-20 mb-8" />
+                <h1 className="text-3xl font-black mb-2 uppercase tracking-tighter" > Biometrick Pro </h1>
+                    < input type = "password" placeholder = "Clave App" value = { unlockPass } onChange = { e => setUnlockPass(e.target.value) } className = "w-full max-w-xs bg-slate-900 border border-slate-800 rounded-3xl p-6 text-white text-center font-bold mb-6 outline-none" />
+                        <button onClick={ () => unlockPass === "acceso2025" ? setIsUnlocked(true) : alert("Incorrecto") } className = "w-full max-w-xs bg-indigo-600 text-white font-black py-6 rounded-3xl uppercase text-[10px] tracking-widest shadow-xl" > Desbloquear </button>
+                            </div>
+    );
+    }
+
+    if (view === 'login') {
+        return (
+            <div className= "min-h-screen bg-white flex flex-col p-8 justify-center items-center font-sans" >
+            <div className="w-full max-w-sm text-slate-900" >
+                <div className="text-center mb-10" > <Calculator className="w-12 h-12 mx-auto mb-4" /> <h2 className="text-4xl font-black uppercase tracking-tighter" > Ingreso < /h2></div >
+                    <div className="flex bg-slate-100 p-1.5 rounded-2xl mb-8" >
+                        <button onClick={ () => setLoginRole('employee') } className = {`flex-1 py-4 rounded-xl font-black text-[10px] uppercase transition-all ${loginRole === 'employee' ? 'bg-white shadow text-indigo-600' : 'text-slate-400'}`
+    }> Empleado </button>
+        < button onClick = {() => setLoginRole('boss')
+} className = {`flex-1 py-4 rounded-xl font-black text-[10px] uppercase transition-all ${loginRole === 'boss' ? 'bg-white shadow text-indigo-600' : 'text-slate-400'}`}> Jefe </button>
+    </div>
+    < div className = "space-y-4" >
+        { loginRole === 'employee' && <input type="text" placeholder = "Tu Nombre" value = { loginName } onChange = { e => setLoginName(e.target.value) } className = "w-full p-6 bg-slate-50 border border-slate-100 rounded-3xl font-bold outline-none" />}
+<input type="password" placeholder = "Tu Clave" value = { loginPass } onChange = { e => setLoginPass(e.target.value) } className = "w-full p-6 bg-slate-50 border border-slate-100 rounded-3xl font-bold outline-none" />
+    { authError && <p className="text-rose-500 text-center font-black text-[10px] uppercase" > { authError } </p>}
+<button onClick={ handleLogin } disabled = { actionLoading } className = "w-full bg-slate-900 text-white py-6 rounded-[2rem] font-black uppercase text-[10px] tracking-widest shadow-2xl flex items-center justify-center active:scale-95 transition-all" > { actionLoading?<Loader2 className = "animate-spin" /> : "Iniciar Sesión"}</button>
+    </div>
+    </div>
+    </div>
+    );
+  }
+
+if (view === 'admin') {
+    return (
+        <div className= "min-h-screen bg-slate-50 p-6 flex flex-col font-sans pb-24 text-slate-900" >
+        <header className="flex justify-between items-center mb-8" > <h1 className="text-2xl font-black uppercase tracking-tighter" > Personal < /h1><button onClick={() => setView('login')} className="p-3 bg-white rounded-2xl shadow-sm text-slate-400"><LogOut className="w-5 h-5" / > </button></header >
+            <div className="space-y-4" >
+            {
+                allEmployees.map(emp => (
+                    <div key= { emp.id } onClick = {() => { setCurrentEmployee(emp); setView('app'); }} className = "bg-white p-6 rounded-[2.5rem] shadow-sm flex items-center justify-between border border-slate-100 active:scale-95" >
+                        <div className="flex items-center gap-4" > <div className="w-12 h-12 bg-indigo-600 text-white rounded-2xl flex items-center justify-center font-black text-lg" > { emp.name[0].toUpperCase() } < /div><p className="font-black uppercase text-sm">{emp.name}</p > </div>
+                            < ChevronRight className = "text-slate-300 w-5 h-5" />
+                                </div>
+          ))
+}
+</div>
+    </div>
+    );
+  }
+
+return (
+    <div className= "min-h-screen bg-slate-50 flex flex-col font-sans pb-32 max-w-md mx-auto shadow-2xl relative text-slate-900" >
+    <canvas ref={ canvasRef } className = "hidden" />
+        { aiMessage && <div className="fixed top-24 left-6 right-6 z-[60] bg-emerald-600 text-white p-4 rounded-2xl shadow-2xl text-center font-black text-[10px] uppercase animate-bounce" > { aiMessage } </div>}
+
+<header className="bg-white px-6 py-6 border-b border-slate-100 sticky top-0 z-40 flex justify-between items-center" >
+    <div className="flex items-center gap-3" >
+        <div className="w-10 h-10 bg-indigo-600 rounded-xl flex items-center justify-center text-white font-black shadow-lg" > { currentEmployee?.name[0].toUpperCase() } </div>
+            < div > <h3 className="font-black text-xs uppercase truncate max-w-[120px]" > { currentEmployee?.name } < /h3><span className="text-[7px] font-black text-slate-400 uppercase tracking-widest">{syncing ? 'Guardando...' : 'En línea'}</span > </div>
+                </div>
+                < button onClick = {() => { setView(loginRole === 'boss' ? 'admin' : 'login'); if (loginRole !== 'boss') setCurrentEmployee(null); }} className = "p-3 bg-slate-50 rounded-2xl text-slate-400 active:text-rose-500" > <LogOut className="w-5 h-5" /> </button>
+                    </header>
+
+                    < main className = "flex-1 p-6 space-y-6 overflow-y-auto" >
+                        { activeTab === 'home' && (
+                            <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4" >
+                                {/* PANEL DE PAGO */ }
+                                < div className = "bg-slate-900 p-8 rounded-[3rem] text-white shadow-2xl relative overflow-hidden" >
+                                    <div className="absolute top-0 right-0 -mr-12 -mt-12 w-48 h-48 bg-indigo-500 rounded-full blur-[80px] opacity-20" > </div>
+                                        < p className = "text-[8px] font-black uppercase tracking-[0.4em] text-slate-500 mb-2" > Pago Estimado </p>
+                                            < h2 className = "text-5xl font-black tracking-tighter mb-8 tabular-nums" > ${ payroll?.total.toLocaleString('es-MX', { minimumFractionDigits: 2 }) } </h2>
+                                                < div className = "grid grid-cols-2 gap-3 text-center" >
+                                                    <div className="bg-white/5 p-4 rounded-2xl border border-white/5" > <p className="text-[7px] font-black uppercase text-slate-500 mb-1" > Total Horas < /p><p className="font-black text-lg">{payroll?.hrs.toFixed(1)}h</p > </div>
+                                                        < div className = "bg-white/5 p-4 rounded-2xl border border-white/5" > <p className="text-[7px] font-black uppercase text-slate-500 mb-1" > Días < /p><p className="font-black text-lg text-emerald-400">{payroll?.days}/7 < /p></div >
+                                                            </div>
+                                                            </div>
+
+{/* BOTONES CÁMARA (SOLO EMPLEADOS) */ }
+{
+    loginRole === 'employee' && (
+        <div className="grid grid-cols-2 gap-4" >
+            <button onClick={ () => openCamera('entry') } className = "bg-white p-7 rounded-[2.5rem] shadow-sm border border-slate-100 flex flex-col items-center gap-4 active:scale-95 text-slate-900" >
+                <div className="w-16 h-16 bg-emerald-100 rounded-[1.5rem] flex items-center justify-center text-emerald-600 shadow-inner" > <ArrowDownCircle className="w-8 h-8" /> </div>
+                    < span className = "font-black text-[9px] uppercase tracking-widest" > Entrada </span>
+                        </button>
+                        < button onClick = {() => openCamera('exit')
+} className = "bg-white p-7 rounded-[2.5rem] shadow-sm border border-slate-100 flex flex-col items-center gap-4 active:scale-95 text-slate-900" >
+    <div className="w-16 h-16 bg-rose-100 rounded-[1.5rem] flex items-center justify-center text-rose-600 shadow-inner" > <ArrowUpCircle className="w-8 h-8" /> </div>
+        < span className = "font-black text-[9px] uppercase tracking-widest" > Salida </span>
+            </button>
+            </div>
+            )}
+
+{/* LISTADO DE HORARIOS */ }
+<div className="bg-white rounded-[2.5rem] p-8 shadow-sm border border-slate-100" >
+    <h4 className="font-black text-[9px] uppercase tracking-[0.3em] text-slate-400 mb-8 flex items-center gap-3" > <Edit3 className="w-4 h-4 text-indigo-500" /> Registro de Horarios </h4>
+        < div className = "space-y-12" >
+        {
+            DAYS_LIST.map(d => {
+                const t = currentEmployee?.weeklyTime?.[d] || { h: 0, m: 0 };
+                const isRest = currentEmployee?.restDays?.[d];
+                const att = currentEmployee?.attendance?.[d] || {};
+
+                return (
+                    <div key= { d } className = {`p-5 rounded-[1.5rem] ${isRest ? 'bg-slate-50 opacity-30' : 'bg-slate-50 border border-slate-100'}`
+            }>
+            <div className="flex items-center justify-between mb-6" >
+            <span className="font-black text-[10px] uppercase text-slate-700" > { d } </span>
+                        {!isRest && (
+                <div className="flex items-center gap-1 bg-indigo-600 text-white px-3 py-1 rounded-full shadow-lg" >
+            <span className="font-black text-sm" > { t.h }h { t.m }m </span>
+            < span className = "text-[7px] font-bold uppercase ml-1 opacity-60" > Total </span>
+            </div>
+            )
+        }
+            </div>
+
+{
+    !isRest && (
+        <div className="space-y-6" >
+            <div className="grid grid-cols-2 gap-4" >
+                <div className="space-y-2 text-center" >
+                    <p className="text-[7px] font-black uppercase text-slate-400 tracking-widest" > Entrada </p>
+                        < input
+    type = "text"
+    value = { att.entry?.time || '' }
+    placeholder = "ej: 5pm"
+    onChange = {(e) => handleExactTimeEdit(d, 'entry', e.target.value)
+}
+className = "w-full bg-white border border-slate-200 rounded-xl text-center font-black text-emerald-600 py-3 text-sm outline-none focus:border-indigo-500 shadow-sm"
+    />
+    </div>
+    < div className = "space-y-2 text-center" >
+        <p className="text-[7px] font-black uppercase text-slate-400 tracking-widest" > Salida </p>
+            < input
+type = "text"
+value = { att.exit?.time || '' }
+placeholder = "ej: 10pm"
+onChange = {(e) => handleExactTimeEdit(d, 'exit', e.target.value)}
+className = "w-full bg-white border border-slate-200 rounded-xl text-center font-black text-rose-600 py-3 text-sm outline-none focus:border-indigo-500 shadow-sm"
+    />
+    </div>
+    </div>
+
+    < div className = "flex gap-4" >
+        { att.entry?.photo && <img src={ att.entry.photo } className = "w-1/2 aspect-video rounded-xl object-cover border border-emerald-100 shadow-sm" />}
+{ att.exit?.photo && <img src={ att.exit.photo } className = "w-1/2 aspect-video rounded-xl object-cover border border-rose-100 shadow-sm" />}
+</div>
+    </div>
+                      )}
+</div>
+                  );
+                })}
+</div>
+    </div>
+    </div>
+        )}
+
+{
+    activeTab === 'settings' && (
+        <div className="animate-in fade-in slide-in-from-bottom-4 space-y-6" >
+            <h2 className="text-3xl font-black tracking-tighter uppercase text-slate-900" > Configuración </h2>
+                < div className = "bg-indigo-600 p-8 rounded-[3rem] text-white shadow-2xl" >
+                    <div className="space-y-8" >
+                        <div>
+                        <p className="text-[9px] font-black uppercase tracking-widest opacity-60 mb-3 flex items-center gap-2" > <DollarSign className="w-3 h-3" /> Valor de la Hora($) </p>
+                            < input type = "number" value = { currentEmployee?.hourlyRate || 0
+} onChange = {(e) => updateDatabase({ hourlyRate: Number(e.target.value) })} className = "w-full bg-white/10 border border-white/10 rounded-2xl p-5 text-4xl font-black outline-none focus:bg-white/20 transition-all text-white" />
+    </div>
+    < div >
+    <p className="text-[9px] font-black uppercase tracking-widest opacity-60 mb-3 flex items-center gap-2" > <Sparkles className="w-3 h-3" /> Estímulo Semanal($) </p>
+        < input type = "number" value = { currentEmployee?.stimulus || 0} onChange = {(e) => updateDatabase({ stimulus: Number(e.target.value) })} className = "w-full bg-white/10 border border-white/10 rounded-2xl p-5 text-4xl font-black outline-none focus:bg-white/20 transition-all text-white" />
+            </div>
+            < div className = "pt-8 border-t border-white/10" >
+                <p className="text-[9px] font-black uppercase tracking-widest opacity-60 mb-2" > Bono Comida($) </p>
+                    < input type = "number" value = { currentEmployee?.foodBonus || 0} onChange = {(e) => updateDatabase({ foodBonus: Number(e.target.value) })} className = "w-full bg-transparent text-xl font-bold outline-none text-white" />
+                        </div>
+                        </div>
+                        </div>
+                        </div>
+        )}
+</main>
+
+    < nav className = "fixed bottom-0 left-0 right-0 bg-white border-t border-slate-100 px-10 py-5 flex justify-between items-center z-50 rounded-t-[3rem] shadow-xl max-w-md mx-auto" >
+        <button onClick={ () => setActiveTab('home') } className = {`flex flex-col items-center gap-1 ${activeTab === 'home' ? 'text-indigo-600 scale-110' : 'text-slate-300'}`}> <Home className="w-6 h-6" /> <span className="text-[8px] font-black uppercase" > Inicio < /span></button >
+            {/* BOTÓN CÁMARA (SOLO EMPLEADOS) */ }
+{
+    loginRole === 'employee' && (
+        <button onClick={ () => openCamera('entry') } className = "bg-slate-900 w-16 h-16 rounded-full flex items-center justify-center -mt-16 border-[6px] border-slate-50 shadow-2xl active:scale-90 relative transition-transform text-white" >
+            <Camera className="w-6 h-6 z-10" />
+                </button>
+        )
+}
+<button onClick={ () => setActiveTab('settings') } className = {`flex flex-col items-center gap-1 ${activeTab === 'settings' ? 'text-indigo-600 scale-110' : 'text-slate-300'}`}> <User className="w-6 h-6" /> <span className="text-[8px] font-black uppercase" > Perfil < /span></button >
+    </nav>
+
+{
+    cameraActive && (
+        <div className="fixed inset-0 z-[100] bg-black flex flex-col max-w-md mx-auto" >
+            <div className="p-10 flex justify-between items-center text-white bg-gradient-to-b from-black/90 to-transparent" > <h3 className="font-black uppercase tracking-tighter text-xl" > Escaneo < /h3><button onClick={() => { if (videoRef.current?.srcObject) (videoRef.current.srcObject as MediaStream).getTracks().forEach(t => t.stop()); setCameraActive(false); }} className="p-4 bg-white/10 rounded - 2xl active: bg - white / 30"><X className="w - 6 h - 6" /></button></div>
+                < div className = "flex-1 relative flex items-center justify-center bg-slate-950" > <video ref={ videoRef } autoPlay playsInline className = "w-full h-full object-cover" /> <div className="absolute inset-0 pointer-events-none flex items-center justify-center border-[50px] border-black/60" > <div className="w-72 h-[450px] border-2 border-dashed border-white/20 rounded-[4rem]" > </div></div > </div>
+                    < div className = "p-14 flex justify-center bg-black" > <button onClick={ captureAndStamp } className = "w-24 h-24 bg-white rounded-full border-[10px] border-indigo-600 flex items-center justify-center shadow-[0_0_50px_rgba(79,70,229,0.3)] active:scale-90 transition-all text-slate-900" > <CameraIcon className="w-10 h-10" /> </button></div >
+                        </div>
+      )
+}
+</div>
+  );
+}
